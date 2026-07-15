@@ -1,0 +1,54 @@
+{
+  "model_id": "M3",
+  "package_version": "2.1",
+  "created": "20260602_105838",
+  "domains_seen": [
+    "CIC-IDS2018",
+    "CIC-IDS2017",
+    "USB-IDS",
+    "Local-Malware"
+  ],
+  "n_features": 18,
+  "feature_names": [
+    "FWD Init Win Bytes",
+    "Fwd IAT Total",
+    "Protocol",
+    "Fwd Seg Size Min",
+    "Bwd Packet Length Mean",
+    "Flow IAT Max",
+    "Packet Length Max",
+    "Flow IAT Std",
+    "Fwd Packet Length Std",
+    "Idle Max",
+    "Packet Length Mean",
+    "Bwd Packet Length Max",
+    "Bwd Packet Length Std",
+    "Fwd Packet Length Mean",
+    "Packet Length Min",
+    "Dst Port",
+    "FIN Flag Count",
+    "Bwd IAT Std"
+  ],
+  "gmm_k": 21,
+  "gmm_threshold": 39.926527896697976,
+  "ae_architecture": {
+    "input_dim": 18,
+    "encoder_layers": [
+      64,
+      48,
+      24,
+      18
+    ],
+    "latent_dim": 16
+  },
+  "shap_precomputed_samples": 2000,
+  "files": {
+    "ae_model": "ae_M3.keras",
+    "model_package": "aegmm_model_package.joblib",
+    "ae_shap_explainer": "ae_shap_explainer.joblib",
+    "gmm_shap_explainer": "gmm_shap_explainer.joblib",
+    "shap_precomputed": "shap_precomputed_2000.joblib",
+    "manifest": "manifest.json"
+  },
+  "usage": "Fast path: joblib.load('shap_precomputed_2000.joblib') \u2192 precomputed SHAP for 2000 samples.\nOn-demand: joblib.load('gmm_shap_explainer.joblib') \u2192 explainer(new_sample_df) for new data.\nRecompute only when model is retrained or dataset changes."
+}

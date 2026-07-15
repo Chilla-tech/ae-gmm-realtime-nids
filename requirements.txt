@@ -1,0 +1,32 @@
+# AE-GMM Real-Time NIDS — pinned dependencies
+# Install with: pip install -r requirements.txt
+#
+# These versions are pinned because the model artifacts
+# (Keras .keras file, joblib pickles) were produced with them.
+# Newer/older versions of tensorflow/keras/scikit-learn may fail to
+# load the saved model or SHAP explainers.
+
+# Core ML stack (must stay pinned for model compatibility)
+tensorflow==2.20.0
+keras==3.12.0
+scikit-learn==1.7.2
+numpy==1.26.4
+scipy==1.15.3
+pandas==2.3.3
+joblib==1.5.3
+shap==0.48.0
+matplotlib==3.10.8
+h5py==3.15.1
+
+# Packet capture (real-time flow extraction)
+scapy==2.7.0
+
+# Desktop GUI — pinned at 6.7.3 to avoid DLL load failures on Python 3.10
+# (6.11.x has a known PySide6/shiboken6 mismatch bug on Windows)
+PySide6-Essentials==6.7.3
+shiboken6==6.7.3
+
+# Optional: legacy Streamlit dashboard (app.py). Not required for the
+# primary desktop app (desktop_app.py). Comment out if you don't need it.
+streamlit==1.58.0
+

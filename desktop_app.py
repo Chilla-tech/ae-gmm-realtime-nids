@@ -687,6 +687,8 @@ class MainWindow(QMainWindow):
             for iface in ifaces:
                 if iface.get("is_monitor"):
                     label = f"[MONITOR] {iface['name']}  (no IP)"
+                elif iface.get("is_link_local"):
+                    label = f"{iface['name']}  (link-local)"
                 else:
                     label = f"{iface['name']}  ({iface['ip']})"
                 if iface.get('description'):

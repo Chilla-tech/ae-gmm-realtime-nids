@@ -160,6 +160,10 @@ def list_interfaces(include_monitor: bool = True) -> List[dict]:
     try:
         from scapy.all import IFACES
         ifaces = []
+
+        # Skip these virtual/system adapters that can't capture real traffic
+        _SKIP_DESCS = {"WAN Miniport"}
+
         for _key, iface in IFACES.data.items():
             ip = getattr(iface, "ip", "") or ""
             mac = getattr(iface, "mac", "") or ""
@@ -167,15 +171,16 @@ def list_interfaces(include_monitor: bool = True) -> List[dict]:
             name = getattr(iface, "name", "") or network_name
             description = getattr(iface, "description", "") or ""
 
-            # Skip link-local
-            if ip.startswith("169.254."):
+            # Skip WAN Miniport adapters (system-level, cannot capture)
+            if any(skip in description for skip in _SKIP_DESCS):
                 continue
 
-            # Determine if this is a monitor (no-IP) interface
-            is_monitor = not ip
+            # Determine interface category
+            is_monitor = not ip          # no IP at all
+            is_link_local = ip.startswith("169.254.")
 
-            # For monitor interfaces, require at least a MAC to filter
-            # out completely virtual/disconnected adapters
+            # For monitor interfaces, require a MAC to filter out truly
+            # disconnected/virtual stubs
             if is_monitor and not include_monitor:
                 continue
             if is_monitor and not mac:
@@ -188,6 +193,7 @@ def list_interfaces(include_monitor: bool = True) -> List[dict]:
                 "mac": mac,
                 "network_name": network_name,
                 "is_monitor": is_monitor,
+                "is_link_local": is_link_local,
             })
         return ifaces
     except Exception as e:

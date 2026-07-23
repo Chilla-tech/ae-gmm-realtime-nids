@@ -276,5 +276,9 @@ def save_adapted_model(
     with open(new_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
 
-    logger.info("Adapted model saved to %s", new_dir)
+    # Write .current pointer so the app loads this model on next startup
+    current_ptr = new_dir.parent / ".current"
+    current_ptr.write_text(new_dir.name, encoding="utf-8")
+
+    logger.info("Adapted model saved to %s (set as current)", new_dir)
     return new_dir

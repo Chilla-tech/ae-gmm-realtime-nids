@@ -21,6 +21,7 @@ dev_scripts/_work/
 
 # ── Adapted models produced by the app (user-specific) ───────
 trained_models/M3_adapted_*/
+trained_models/.current
 
 # ── OS / editor cruft ────────────────────────────────────────
 .DS_Store

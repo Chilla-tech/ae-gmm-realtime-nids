@@ -109,18 +109,95 @@ def _get_standardize():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SampleBuffer — CSV-backed rotating buffer for retraining data collection
+#  ReplayBuffer — unified disk-backed buffer for adaptation
 # ═══════════════════════════════════════════════════════════════════════════
+
+REPLAY_MAX_SAMPLES = 288_000       # max replay buffer size
+REPLAY_POST_ADAPT_RATIO = 0.30     # fraction of training data added to replay after adapt
+REPLAY_POST_ADAPT_CAP = 86_400     # max samples added to replay per adaptation round
+REPLAY_INCR_RATIO = 0.30           # fraction of incremental training batch from replay
+MAX_TRAINING_SIZE = 288_000        # max total training samples per adaptation
+
+
+class ReplayBuffer:
+    """
+    Unified, disk-persisted replay buffer for incremental adaptation.
+
+    Stores scaled feature vectors (18-dim) used for MAS+Replay training.
+    Only high-confidence benign flows and human-confirmed-benign flows are
+    admitted.
+
+    CSV format: one column per feature (feature_names), stored as floats.
+    """
+
+    def __init__(self, buffer_dir: str, feature_names: list,
+                 max_samples: int = REPLAY_MAX_SAMPLES):
+        self.buffer_dir = Path(buffer_dir)
+        self.buffer_dir.mkdir(parents=True, exist_ok=True)
+        self.csv_path = self.buffer_dir / "replay_buffer.csv"
+        self.feature_names = list(feature_names)
+        self.max_samples = max_samples
+
+    @property
+    def count(self) -> int:
+        if not self.csv_path.exists():
+            return 0
+        with open(self.csv_path, "r", encoding="utf-8") as fh:
+            return max(0, sum(1 for _ in fh) - 1)
+
+    @property
+    def is_empty(self) -> bool:
+        return self.count == 0
+
+    def add(self, X_scaled: np.ndarray) -> int:
+        """Append scaled feature vectors to the buffer. Returns count added."""
+        if X_scaled.ndim == 1:
+            X_scaled = X_scaled.reshape(1, -1)
+        if len(X_scaled) == 0:
+            return 0
+
+        df = pd.DataFrame(X_scaled, columns=self.feature_names)
+        header = not self.csv_path.exists()
+        df.to_csv(self.csv_path, mode="a", header=header, index=False)
+
+        # Rotate if over capacity
+        if self.count > self.max_samples:
+            self._rotate()
+
+        return len(X_scaled)
+
+    def load(self) -> np.ndarray:
+        """Load the full buffer as a numpy array (N, 18). Returns empty if no data."""
+        if not self.csv_path.exists():
+            return np.empty((0, len(self.feature_names)))
+        df = pd.read_csv(self.csv_path)
+        return df[self.feature_names].values.astype(np.float64)
+
+    def sample(self, n: int, random_state: int = 42) -> np.ndarray:
+        """Sample up to n rows from the buffer (without replacement)."""
+        data = self.load()
+        if len(data) == 0:
+            return np.empty((0, len(self.feature_names)))
+        n = min(n, len(data))
+        rng = np.random.default_rng(random_state)
+        idx = rng.choice(len(data), size=n, replace=False)
+        return data[idx]
+
+    def clear(self) -> None:
+        if self.csv_path.exists():
+            self.csv_path.unlink()
+
+    def _rotate(self):
+        """Keep only the most recent max_samples rows."""
+        df = pd.read_csv(self.csv_path)
+        if len(df) > self.max_samples:
+            df.tail(self.max_samples).to_csv(self.csv_path, index=False)
+            logger.info("Replay buffer rotated → kept last %d rows", self.max_samples)
+
 
 class SampleBuffer:
     """
-    Append-only CSV buffer with rotation.
-
-    Parameters
-    ----------
-    name : str          Buffer identifier (e.g. ``'benign'``, ``'attack'``).
-    buffer_dir : str    Directory where the CSV file lives.
-    max_samples : int   Maximum rows before oldest are dropped.
+    Append-only CSV buffer with rotation (legacy, kept for feedback logging).
     """
 
     def __init__(self, name: str, buffer_dir: str, max_samples: int = 500_000):
@@ -130,20 +207,14 @@ class SampleBuffer:
         self.csv_path = self.buffer_dir / f"{name}_buffer.csv"
         self.max_samples = max_samples
 
-    # -- properties ----------------------------------------------------------
-
     @property
     def count(self) -> int:
         if not self.csv_path.exists():
             return 0
-        # fast line count
         with open(self.csv_path, "r", encoding="utf-8") as fh:
             return max(0, sum(1 for _ in fh) - 1)
 
-    # -- public API ----------------------------------------------------------
-
     def add(self, df: pd.DataFrame) -> None:
-        """Append *df* rows to the CSV buffer, rotating if over capacity."""
         if df.empty:
             return
         header = not self.csv_path.exists()
@@ -152,17 +223,13 @@ class SampleBuffer:
             self._rotate()
 
     def load(self) -> pd.DataFrame:
-        """Return buffer contents as a DataFrame."""
         if self.csv_path.exists():
             return pd.read_csv(self.csv_path)
         return pd.DataFrame()
 
     def clear(self) -> None:
-        """Delete the buffer CSV."""
         if self.csv_path.exists():
             self.csv_path.unlink()
-
-    # -- internals -----------------------------------------------------------
 
     def _rotate(self):
         full = pd.read_csv(self.csv_path)
@@ -201,6 +268,11 @@ class M3InferenceEngine:
         self._load_shap()
 
         buf = Path(buffer_dir) if buffer_dir else self.deploy_dir.parent / "buffers"
+
+        # Unified replay buffer for incremental adaptation
+        self.replay_buffer = ReplayBuffer(str(buf), self.features)
+
+        # Legacy buffers (for feedback logging / compatibility)
         self.benign_buffer = SampleBuffer("benign", str(buf), buffer_max)
         self.attack_buffer = SampleBuffer("attack", str(buf), buffer_max)
 
@@ -316,15 +388,34 @@ class M3InferenceEngine:
     # ── buffering ──────────────────────────────────────────────────────────
 
     def _buffer(self, results: pd.DataFrame):
+        """Route flows to buffers after prediction.
+
+        Replay buffer admission criteria:
+          - Predicted Normal AND gmm_score >= 85th percentile of all scores
+            (i.e., high-confidence benign — well above the threshold)
+        """
         benign = results[results["prediction"] == "Normal"]
         attack = results[
             (results["prediction"] == "Attack")
             & (results["confidence"] >= self.attack_conf_threshold)
         ]
+
+        # Legacy buffers (kept for feedback logging)
         if not benign.empty:
             self.benign_buffer.add(benign)
         if not attack.empty:
             self.attack_buffer.add(attack)
+
+        # Replay buffer: only high-confidence benign (score > p85 of current batch)
+        if not benign.empty and "gmm_score" in benign.columns:
+            scores = results["gmm_score"].values
+            p85 = np.percentile(scores, 85)
+            high_conf_benign = benign[benign["gmm_score"] >= p85]
+            if not high_conf_benign.empty:
+                X_scaled = self.scaler.transform(
+                    high_conf_benign[self.features].values.astype(np.float64)
+                )
+                self.replay_buffer.add(X_scaled)
 
     # ── human feedback ─────────────────────────────────────────────────────
 
@@ -359,6 +450,10 @@ class M3InferenceEngine:
         # Route to buffer by the *human* label, not the model prediction
         if human_label == "Normal":
             self.benign_buffer.add(row)
+            # Also add to replay buffer (human-confirmed benign)
+            X_raw = sample[self.features].values.astype(np.float64).reshape(1, -1)
+            X_scaled = self.scaler.transform(X_raw)
+            self.replay_buffer.add(X_scaled)
             return "benign"
         else:
             self.attack_buffer.add(row)
@@ -440,9 +535,10 @@ class M3InferenceEngine:
     @property
     def buffer_stats(self) -> dict:
         return {
+            "replay_count": self.replay_buffer.count,
+            "replay_max": self.replay_buffer.max_samples,
             "benign_count": self.benign_buffer.count,
             "attack_count": self.attack_buffer.count,
-            "buffer_max": self.benign_buffer.max_samples,
             "attack_conf_threshold": self.attack_conf_threshold,
         }
 

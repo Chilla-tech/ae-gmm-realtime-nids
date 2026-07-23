@@ -110,12 +110,19 @@ class RetrainWorker(QThread):
 
     def _run_initial(self):
         """Phase 1: From-scratch environment adaptation."""
+        from engine import MAX_TRAINING_SIZE
+
         adapter = InitialEnvironmentAdapter(
             input_dim=len(self.engine.features),
             gmm_k=self.engine.gmm.n_components,
         )
         X_raw = self.flow_data[self.engine.features].values.astype(np.float64)
         X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Cap at MAX_TRAINING_SIZE (288K)
+        if len(X_raw) > MAX_TRAINING_SIZE:
+            idx = np.random.choice(len(X_raw), MAX_TRAINING_SIZE, replace=False)
+            X_raw = X_raw[idx]
 
         result = adapter.adapt(
             X_raw,
@@ -130,25 +137,58 @@ class RetrainWorker(QThread):
         return result
 
     def _run_incremental(self):
-        """Phase 2+: MAS+Replay incremental adaptation."""
+        """Phase 2+: MAS+Replay incremental adaptation.
+
+        Training composition:
+          - 30% from replay buffer (max 86,400 samples)
+          - 70% from current in-memory flows (new environment data)
+          - Total capped at MAX_TRAINING_SIZE (288K)
+        """
+        from engine import MAX_TRAINING_SIZE, REPLAY_INCR_RATIO, REPLAY_POST_ADAPT_CAP
+
+        # Scale new data
+        X_raw = self.flow_data[self.engine.features].values.astype(np.float64)
+        X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        X_new_scaled = self.engine.scaler.transform(X_raw)
+
+        # Determine training composition
+        n_replay_available = len(self.replay_buffer) if self.replay_buffer is not None else 0
+        n_replay = min(
+            int(MAX_TRAINING_SIZE * REPLAY_INCR_RATIO),  # 30% of max
+            REPLAY_POST_ADAPT_CAP,                         # hard cap 86,400
+            n_replay_available,                            # what's available
+        )
+        n_new = min(
+            len(X_new_scaled),
+            MAX_TRAINING_SIZE - n_replay,                  # remainder goes to new data
+        )
+
+        # Subsample if needed
+        if len(X_new_scaled) > n_new:
+            idx = np.random.choice(len(X_new_scaled), n_new, replace=False)
+            X_new_scaled = X_new_scaled[idx]
+
+        # Sample from replay buffer
+        if n_replay > 0 and self.replay_buffer is not None:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(len(self.replay_buffer), n_replay, replace=False)
+            replay_subset = self.replay_buffer[idx]
+        else:
+            replay_subset = np.empty((0, len(self.engine.features)))
+
         adapter = IncrementalAdapter(
             ae_model=self.engine.ae_model,
             scaler=self.engine.scaler,
             gmm=self.engine.gmm,
             features=self.engine.features,
             lambda_mas=self.lambda_mas,
-            replay_ratio=self.replay_ratio,
+            replay_ratio=REPLAY_INCR_RATIO,
             gmm_k=self.engine.gmm.n_components,
         )
 
-        # Scale new data with current scaler
-        X_raw = self.flow_data[self.engine.features].values.astype(np.float64)
-        X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
-        X_new_scaled = self.engine.scaler.transform(X_raw)
-
         result = adapter.adapt(
             X_new_scaled,
-            self.replay_buffer,
+            replay_subset,
             ae_epochs=1000,
             ae_lr=1e-3,
             progress_cb=lambda s, t, m: self.progress.emit(s, t, m),
@@ -491,9 +531,6 @@ class MainWindow(QMainWindow):
         self._pending_flows: deque[dict] = deque()   # raw flow dicts from sniff thread
         self._lock = threading.Lock()  # protects _pending_flows from callback thread
 
-        # ── Replay buffer for incremental adaptation (MAS+Replay) ────────
-        self._replay_buffer: np.ndarray | None = None
-
         # Drip timer: feed one row at a time into the table
         self._drip_timer = QTimer(self)
         self._drip_timer.setInterval(150)  # ~7 rows/sec
@@ -600,6 +637,11 @@ class MainWindow(QMainWindow):
         fm.addSeparator()
         act = QAction("&Adapt Model to Environment…", self)
         act.triggered.connect(self._start_adaptation)
+        fm.addAction(act)
+
+        act = QAction("Adjust &Threshold…", self)
+        act.setShortcut("Ctrl+T")
+        act.triggered.connect(self._adjust_threshold)
         fm.addAction(act)
 
         fm.addSeparator()
@@ -1074,6 +1116,53 @@ class MainWindow(QMainWindow):
         else:
             self._warn_banner.setVisible(False)
 
+    def _adjust_threshold(self):
+        """Let the user adjust the anomaly threshold without retraining."""
+        from retrain import compute_percentiles
+
+        df = self.table_model._df
+        if df.empty:
+            QMessageBox.information(
+                self, "Adjust Threshold",
+                "No flow data loaded.\n"
+                "Capture or load traffic first so the score distribution "
+                "can be visualized."
+            )
+            return
+
+        # Score current data with existing model
+        X = df[self.engine.features].values.astype(np.float64)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        X_scaled = self.engine.scaler.transform(X)
+        X_recon = self.engine.ae_model.predict(X_scaled, verbose=0)
+        errors = np.abs(X_scaled - X_recon)
+        scores = self.engine.gmm.score_samples(errors)
+        percentiles = compute_percentiles(scores)
+
+        dlg = ThresholdPickerDialog(
+            scores=scores,
+            auto_threshold=self.engine.threshold,
+            percentiles=percentiles,
+            parent=self,
+        )
+        # Relabel for this context
+        dlg.setWindowTitle("Adjust Anomaly Threshold")
+        dlg.radio_auto.setText(
+            f"Current threshold = {self.engine.threshold:.4f}"
+        )
+
+        if dlg.exec() == QDialog.Accepted:
+            chosen = dlg.get_threshold()
+            old = self.engine.threshold
+            if chosen != old:
+                self.engine.threshold = chosen
+                self._repredict_all()
+                logger.info("Threshold changed: %.4f → %.4f", old, chosen)
+                self.sbar.showMessage(
+                    f"Threshold updated: {old:.4f} → {chosen:.4f}  |  "
+                    f"All {len(df)} rows re-predicted.", 10000
+                )
+
     def _start_adaptation(self):
         """Collect data and launch the adaptation workflow.
 
@@ -1094,9 +1183,8 @@ class MainWindow(QMainWindow):
         n_atk = int((df.get("prediction", pd.Series(dtype=str)) == "Attack").sum())
         n_norm = n_total - n_atk
 
-        # Determine mode: initial if no replay buffer exists, else incremental
-        has_replay = hasattr(self, '_replay_buffer') and self._replay_buffer is not None \
-            and len(self._replay_buffer) > 0
+        # Determine mode: initial if replay buffer is empty, else incremental
+        has_replay = not self.engine.replay_buffer.is_empty
         mode = "incremental" if has_replay else "initial"
 
         if mode == "initial":
@@ -1115,15 +1203,15 @@ class MainWindow(QMainWindow):
                 f"Continue?"
             )
         else:
-            n_replay = len(self._replay_buffer)
+            n_replay = self.engine.replay_buffer.count
             msg = (
                 f"<b>Incremental Drift Adaptation (MAS+Replay)</b><br><br>"
                 f"New flows: <b>{n_total}</b> | "
-                f"Replay buffer: <b>{n_replay}</b> samples<br><br>"
+                f"Replay buffer: <b>{n_replay:,}</b> samples<br><br>"
                 f"This will:<br>"
                 f"  1. Checkpoint current model<br>"
                 f"  2. Compute MAS importance on replay buffer<br>"
-                f"  3. Fine-tune AE with MAS penalty (λ=50) + replay mixing<br>"
+                f"  3. Fine-tune AE with MAS penalty (λ=50) + replay mixing (30%)<br>"
                 f"  4. Refit GMM on mixed reconstruction errors<br>"
                 f"  5. Let you review and accept/reject<br><br>"
                 f"<i>You can roll back if results are unsatisfactory.</i><br><br>"
@@ -1148,11 +1236,14 @@ class MainWindow(QMainWindow):
         self._progress.setTextVisible(True)
         self.sbar.addWidget(self._progress)
 
+        # Load replay data from disk for incremental mode
+        replay_data = self.engine.replay_buffer.load() if has_replay else None
+
         self._retrain_worker = RetrainWorker(
             engine=self.engine,
             flow_data=df,
             mode=mode,
-            replay_buffer=self._replay_buffer if has_replay else None,
+            replay_buffer=replay_data,
         )
         self._retrain_worker.progress.connect(self._on_retrain_progress)
         self._retrain_worker.finished.connect(self._on_retrain_finished)
@@ -1189,6 +1280,8 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             chosen = dlg.get_threshold()
 
+            from engine import REPLAY_POST_ADAPT_RATIO, REPLAY_POST_ADAPT_CAP, MAX_TRAINING_SIZE
+
             if mode == "initial":
                 # ── Swap in the new from-scratch model ────────────────
                 self.engine.scaler = adapter.scaler
@@ -1196,11 +1289,22 @@ class MainWindow(QMainWindow):
                 self.engine.gmm = adapter.gmm
                 self.engine.threshold = chosen
 
-                # Build replay buffer from current data (scaled with new scaler)
+                # Populate replay buffer: 30% of training samples (capped at 86,400)
                 df = self.table_model._df
                 X_raw = df[self.engine.features].values.astype(np.float64)
                 X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
-                self._replay_buffer = adapter.scaler.transform(X_raw)
+                X_scaled = adapter.scaler.transform(X_raw)
+
+                n_to_add = min(
+                    int(len(X_scaled) * REPLAY_POST_ADAPT_RATIO),
+                    REPLAY_POST_ADAPT_CAP
+                )
+                if n_to_add > 0:
+                    idx = np.random.choice(len(X_scaled), n_to_add, replace=False)
+                    # Update the replay buffer's feature_names to match new scaler
+                    self.engine.replay_buffer.feature_names = self.engine.features
+                    self.engine.replay_buffer.clear()
+                    self.engine.replay_buffer.add(X_scaled[idx])
 
                 # Save adapted model
                 new_dir = save_adapted_model(
@@ -1215,11 +1319,10 @@ class MainWindow(QMainWindow):
                     domains_seen=self.engine.domains_seen,
                 )
                 self.engine.deploy_dir = new_dir
-
-                # Invalidate SHAP cache
                 self.engine.shap_cache = None
 
-                logger.info("Initial adaptation accepted: threshold=%.4f", chosen)
+                logger.info("Initial adaptation accepted: threshold=%.4f, "
+                            "replay buffer seeded with %d samples", chosen, n_to_add)
 
             else:
                 # ── Incremental mode: accept or rollback ──────────────
@@ -1228,17 +1331,19 @@ class MainWindow(QMainWindow):
                 self.engine.gmm = new_gmm
                 self.engine.threshold = chosen
 
-                # Extend replay buffer with new data
+                # Add 30% of current in-memory flows to replay buffer (cap 86,400)
                 df = self.table_model._df
                 X_raw = df[self.engine.features].values.astype(np.float64)
                 X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
                 X_new_scaled = self.engine.scaler.transform(X_raw)
-                # Keep replay buffer bounded (max 50k samples)
-                combined = np.concatenate([self._replay_buffer, X_new_scaled], axis=0)
-                if len(combined) > 50000:
-                    idx = np.random.choice(len(combined), 50000, replace=False)
-                    combined = combined[idx]
-                self._replay_buffer = combined
+
+                n_to_add = min(
+                    int(len(X_new_scaled) * REPLAY_POST_ADAPT_RATIO),
+                    REPLAY_POST_ADAPT_CAP
+                )
+                if n_to_add > 0:
+                    idx = np.random.choice(len(X_new_scaled), n_to_add, replace=False)
+                    self.engine.replay_buffer.add(X_new_scaled[idx])
 
                 # Save
                 new_dir = save_adapted_model(
@@ -1255,19 +1360,21 @@ class MainWindow(QMainWindow):
                 self.engine.deploy_dir = new_dir
                 self.engine.shap_cache = None
 
-                logger.info("Incremental adaptation accepted: threshold=%.4f", chosen)
+                logger.info("Incremental adaptation accepted: threshold=%.4f, "
+                            "added %d samples to replay", chosen, n_to_add)
 
             # Re-predict all rows with new model + threshold
             self._repredict_all()
 
             mode_label = "Initial (from scratch)" if mode == "initial" \
                 else "Incremental (MAS+Replay)"
+            replay_count = self.engine.replay_buffer.count
             QMessageBox.information(
                 self, "Adaptation Complete",
                 f"<b>Model adapted successfully!</b><br><br>"
                 f"Mode: {mode_label}<br>"
                 f"New threshold: <b>{self.engine.threshold:.4f}</b><br>"
-                f"Replay buffer: {len(self._replay_buffer)} samples<br><br>"
+                f"Replay buffer: {replay_count:,} samples<br><br>"
                 f"All rows re-predicted with the updated model."
             )
         else:

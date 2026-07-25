@@ -339,6 +339,18 @@ class M3InferenceEngine:
         if standardize:
             work = _get_standardize()(work)
 
+        # Some datasets contain both canonical and aliased headers
+        # (e.g. "Dst Port" + "Destination Port"), which collapse to the
+        # same name after standardization. Keep the first occurrence so the
+        # feature matrix width stays aligned with the trained scaler.
+        if work.columns.duplicated().any():
+            dup_cols = work.columns[work.columns.duplicated()].unique().tolist()
+            logger.warning(
+                "Dropping duplicated columns after standardization: %s",
+                dup_cols,
+            )
+            work = work.loc[:, ~work.columns.duplicated(keep="first")]
+
         missing = [f for f in self.features if f not in work.columns]
         if missing:
             raise ValueError(f"Missing features in input: {missing}")
@@ -349,6 +361,12 @@ class M3InferenceEngine:
 
         # feature matrix
         X = work[self.features].values.astype(np.float64)
+        expected = getattr(self.scaler, "n_features_in_", None)
+        if expected is not None and X.shape[1] != expected:
+            raise ValueError(
+                f"Prepared {X.shape[1]} features, but scaler expects {expected}. "
+                "Please verify model feature names and CSV headers."
+            )
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
         # AE → reconstruction error → GMM score

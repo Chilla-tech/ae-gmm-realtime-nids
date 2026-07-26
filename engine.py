@@ -355,9 +355,15 @@ class M3InferenceEngine:
         if missing:
             raise ValueError(f"Missing features in input: {missing}")
 
-        # optional metadata
+        # optional metadata — skip columns that are already model features
+        # to avoid duplicate columns in the result DataFrame
         META_COLS = ["Flow ID", "Src IP", "Dst IP", "Src Port", "Dst Port", "Timestamp"]
-        meta = {c: work[c].values for c in META_COLS if c in work.columns}
+        feat_set = set(self.features)
+        meta = {
+            c: work[c].values
+            for c in META_COLS
+            if c in work.columns and c not in feat_set
+        }
 
         # feature matrix
         X = work[self.features].values.astype(np.float64)

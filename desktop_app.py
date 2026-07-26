@@ -914,8 +914,7 @@ class MainWindow(QMainWindow):
             self.lbl_fb.setText(f"Feedback: {fb}")
 
         self.lbl_buffers.setText(
-            f"Buffers — benign: {self.engine.benign_buffer.count}  "
-            f"attack: {self.engine.attack_buffer.count}"
+            f"Replay Buffer: {self.engine.replay_buffer.count:,} samples"
         )
 
         self._check_attack_rate()

@@ -412,11 +412,10 @@ class M3InferenceEngine:
     # ── buffering ──────────────────────────────────────────────────────────
 
     def _buffer(self, results: pd.DataFrame):
-        """Route flows to buffers after prediction.
+        """Route flows to legacy buffers after prediction.
 
-        Replay buffer admission criteria:
-          - Predicted Normal AND gmm_score >= 85th percentile of all scores
-            (i.e., high-confidence benign — well above the threshold)
+        Note: Replay buffer is NOT populated here. It is only seeded
+        after adaptation (30% of training data per round).
         """
         benign = results[results["prediction"] == "Normal"]
         attack = results[
@@ -424,22 +423,10 @@ class M3InferenceEngine:
             & (results["confidence"] >= self.attack_conf_threshold)
         ]
 
-        # Legacy buffers (kept for feedback logging)
         if not benign.empty:
             self.benign_buffer.add(benign)
         if not attack.empty:
             self.attack_buffer.add(attack)
-
-        # Replay buffer: only high-confidence benign (score > p85 of current batch)
-        if not benign.empty and "gmm_score" in benign.columns:
-            scores = results["gmm_score"].values
-            p85 = np.percentile(scores, 85)
-            high_conf_benign = benign[benign["gmm_score"] >= p85]
-            if not high_conf_benign.empty:
-                X_scaled = self.scaler.transform(
-                    high_conf_benign[self.features].values.astype(np.float64)
-                )
-                self.replay_buffer.add(X_scaled)
 
     # ── human feedback ─────────────────────────────────────────────────────
 
@@ -474,10 +461,6 @@ class M3InferenceEngine:
         # Route to buffer by the *human* label, not the model prediction
         if human_label == "Normal":
             self.benign_buffer.add(row)
-            # Also add to replay buffer (human-confirmed benign)
-            X_raw = sample[self.features].values.astype(np.float64).reshape(1, -1)
-            X_scaled = self.scaler.transform(X_raw)
-            self.replay_buffer.add(X_scaled)
             return "benign"
         else:
             self.attack_buffer.add(row)

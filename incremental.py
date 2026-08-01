@@ -353,9 +353,11 @@ class InitialEnvironmentAdapter:
         )
         self.gmm.fit(errors)
 
-        # ── Step 4: Score and compute percentiles ─────────────────────
-        progress_cb(4, total_steps, "Computing score distribution…")
-        self.scores = self.gmm.score_samples(errors)
+        # ── Step 4: Score using VAL split only (unseen by AE) ─────────
+        progress_cb(4, total_steps, "Computing score distribution (val split)…")
+        val_recon = self.ae_model.predict(X_val, verbose=0)
+        val_errors = np.abs(X_val - val_recon)
+        self.scores = self.gmm.score_samples(val_errors)
         percentiles = compute_percentiles(self.scores)
 
         # Default threshold: 5th percentile (conservative)
@@ -536,7 +538,10 @@ class IncrementalAdapter:
         )
         self.new_gmm.fit(errors)
 
-        self.scores = self.new_gmm.score_samples(errors)
+        # Score using VAL split only (unseen by AE during this round)
+        val_recon = self.ae_model.predict(X_val, verbose=0)
+        val_errors = np.abs(X_val - val_recon)
+        self.scores = self.new_gmm.score_samples(val_errors)
         percentiles = compute_percentiles(self.scores)
         self.new_threshold = percentiles["p5"]
 

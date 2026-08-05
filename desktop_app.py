@@ -531,10 +531,10 @@ class MainWindow(QMainWindow):
         self._pending_flows: deque[dict] = deque()   # raw flow dicts from sniff thread
         self._lock = threading.Lock()  # protects _pending_flows from callback thread
 
-        # Drip timer: feed one row at a time into the table
+        # Drip timer: feed batches of flows into the table
         self._drip_timer = QTimer(self)
-        self._drip_timer.setInterval(150)  # ~7 rows/sec
-        self._drip_timer.timeout.connect(self._drip_row)
+        self._drip_timer.setInterval(100)
+        self._drip_timer.timeout.connect(self._drip_batch)
         # Feature columns for display (Dst Port already in META_COLS)
         self._feat_cols = [f for f in self.engine.features if f not in META_COLS]
         # Timestamp first, then label cols, then meta, features, feedback last
@@ -818,27 +818,34 @@ class MainWindow(QMainWindow):
             logger.warning("Prediction failed for flow: %s", exc)
             return None
 
-    def _drip_row(self):
-        """Pop one pending flow, predict, and append to the table."""
+    DRIP_BATCH_SIZE = 128  # flows per timer tick
+
+    def _drip_batch(self):
+        """Pop up to DRIP_BATCH_SIZE pending flows, batch-predict, append."""
         with self._lock:
             if not self._pending_flows:
-                # Queue empty — if capture stopped, stop the timer too
                 if self._extractor is None:
                     self._drip_timer.stop()
                     self.sbar.showMessage("Capture stopped.", 5000)
                 return
-            flow = self._pending_flows.popleft()
+            batch_size = min(len(self._pending_flows), self.DRIP_BATCH_SIZE)
+            flows = [self._pending_flows.popleft() for _ in range(batch_size)]
             queued = len(self._pending_flows)
 
-        row = self._predict_one(flow)
-        if row is None:
+        try:
+            batch_df = pd.DataFrame(flows)
+            results = self.engine.predict(batch_df)
+            if "human_label" not in results.columns:
+                results["human_label"] = "—"
+            results = self._reorder(results)
+        except Exception as exc:
+            logger.warning("Batch prediction failed: %s", exc)
             return
 
-        row_df = row.to_frame().T
-        self.table_model.append_rows(row_df)
-        self._auto_resize()
+        self.table_model.append_rows(results)
         self._refresh_status()
-        # Auto-scroll to the latest row
+
+        # Auto-scroll to latest
         last = self.table_model.rowCount() - 1
         if last >= 0:
             proxy_idx = self.proxy.index(last, 0)
